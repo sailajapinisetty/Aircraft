@@ -1,0 +1,38 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function sessionDoc(sessionId) {
+      return get(/databases/$(database)/documents/sessions/$(sessionId));
+    }
+
+    function isSessionAdmin(sessionId) {
+      return signedIn() && sessionDoc(sessionId).data.adminUid == request.auth.uid;
+    }
+
+    match /sessions/{sessionId} {
+      allow read: if signedIn();
+      allow create: if signedIn();
+      allow update: if signedIn() && (
+        resource.data.adminUid == request.auth.uid ||
+        (resource.data.adminUid == null && request.resource.data.adminUid == request.auth.uid)
+      );
+
+      match /participants/{userId} {
+        allow read: if signedIn();
+        allow create, update: if signedIn() && request.auth.uid == userId;
+      }
+
+      match /participantTrips/{userId} {
+        allow read: if signedIn() && (
+          request.auth.uid == userId ||
+          isSessionAdmin(sessionId)
+        );
+        allow create, update: if signedIn() && request.auth.uid == userId;
+      }
+    }
+  }
+}
