@@ -15,6 +15,8 @@ import { FIREBASE_CONFIG, SESSION_ID } from "./firebase-config.js";
 
 const MAX_TRIPS_PER_PLAYER = 50;
 const colors = ["#ef6f6c", "#0f9d8d", "#f2a541", "#7b9acc", "#d17ab4", "#84b35a"];
+const LOCAL_SESSION_KEY = "trip-sprint-local-session";
+const LOCAL_UID_KEY = "trip-sprint-local-uid";
 
 const map = L.map("map", {
   worldCopyJump: true,
@@ -49,6 +51,7 @@ const ui = {
 };
 
 const state = {
+  runtimeMode: "firebase",
   authUid: null,
   participants: [],
   visibleTripsByUid: {},
@@ -78,12 +81,10 @@ let participantTripsCollectionRef;
 bindUiEvents();
 
 if (!isFirebaseConfigReady()) {
-  renderSetupError(
-    "Firebase is not configured yet. Edit firebase-config.js with your Firebase project keys before deploying to GitHub Pages.",
-  );
+  initializeLocalDemoMode();
 } else {
   initializeRealtimeApp().catch((error) => {
-    renderSetupError(`Firebase initialization failed: ${error.message}`);
+    initializeLocalDemoMode(`Firebase unavailable. Falling back to local demo mode: ${error.message}`);
   });
 }
 
@@ -225,6 +226,126 @@ async function initializeRealtimeApp() {
   });
 }
 
+function initializeLocalDemoMode(message) {
+  state.runtimeMode = "local";
+  state.authUid = getOrCreateLocalUid();
+  restoreProfileOrPrompt();
+  applyLocalSession(loadLocalSession());
+
+  if (message) {
+    ui.mapHint.textContent = message;
+  } else {
+    ui.mapHint.textContent = "Local demo mode active. Join works locally and syncs across tabs on this browser.";
+  }
+
+  window.addEventListener("storage", (event) => {
+    if (event.key === LOCAL_SESSION_KEY) {
+      applyLocalSession(loadLocalSession());
+    }
+  });
+}
+
+function getOrCreateLocalUid() {
+  const existingUid = localStorage.getItem(LOCAL_UID_KEY);
+  if (existingUid) {
+    return existingUid;
+  }
+
+  const nextUid = `local-${crypto.randomUUID()}`;
+  localStorage.setItem(LOCAL_UID_KEY, nextUid);
+  return nextUid;
+}
+
+function createEmptyLocalSession() {
+  return {
+    adminUid: null,
+    isRoundActive: false,
+    roundEndsAtMs: null,
+    roundResult: null,
+    maxTripsPerPlayer: MAX_TRIPS_PER_PLAYER,
+    roundNumber: 1,
+    sessionVersion: 1,
+    participants: {},
+    participantTrips: {},
+  };
+}
+
+function loadLocalSession() {
+  const rawValue = localStorage.getItem(LOCAL_SESSION_KEY);
+  if (!rawValue) {
+    return createEmptyLocalSession();
+  }
+
+  try {
+    const parsed = JSON.parse(rawValue);
+    return {
+      ...createEmptyLocalSession(),
+      ...parsed,
+      participants: parsed.participants || {},
+      participantTrips: parsed.participantTrips || {},
+    };
+  } catch {
+    return createEmptyLocalSession();
+  }
+}
+
+function saveLocalSession(session) {
+  localStorage.setItem(LOCAL_SESSION_KEY, JSON.stringify(session));
+  applyLocalSession(session);
+}
+
+function applyLocalSession(session) {
+  state.isRoundActive = Boolean(session.isRoundActive);
+  state.roundEndsAtMs = session.roundEndsAtMs || null;
+  state.roundResult = session.roundResult || null;
+  state.maxTripsPerPlayer = session.maxTripsPerPlayer || MAX_TRIPS_PER_PLAYER;
+  state.roundNumber = session.roundNumber || 1;
+  state.sessionVersion = session.sessionVersion || 1;
+  state.adminUid = session.adminUid || null;
+
+  const visibleTripsByUid = {};
+  const participants = Object.entries(session.participants || {})
+    .map(([participantId, participant]) => {
+      const participantTrips = session.participantTrips?.[participantId];
+      const trips = participantTrips && participantTrips.sessionVersion === state.sessionVersion
+        ? participantTrips.trips || []
+        : [];
+
+      if (participantId === state.authUid || participantId === state.adminUid) {
+        visibleTripsByUid[participantId] = isAdminUser()
+          ? trips
+          : participantId === state.authUid
+            ? trips
+            : [];
+      } else if (isAdminUser()) {
+        visibleTripsByUid[participantId] = trips;
+      }
+
+      return {
+        id: participantId,
+        name: participant.name,
+        objectType: participant.objectType,
+        color: participant.color,
+        tripCount: participant.tripCount || 0,
+        totalDistanceKm: participant.totalDistanceKm || 0,
+        longestTripDistanceKm: participant.longestTripDistanceKm || 0,
+        isAdmin: participantId === session.adminUid,
+        trips: [],
+      };
+    })
+    .filter((participant) => participant.sessionVersion !== 0)
+    .sort((left, right) => left.name.localeCompare(right.name));
+
+  state.visibleTripsByUid = visibleTripsByUid;
+  state.participants = participants;
+
+  if (!state.isRoundActive) {
+    clearPendingStart();
+  }
+
+  renderAll();
+}
+
 function subscribeSession() {
   if (state.unsubscribeSession) {
     state.unsubscribeSession();
@@ -362,6 +483,34 @@ function attachVisibleTrips() {
 }
 
 async function joinRound(name, objectType) {
+  if (state.runtimeMode === "local") {
+    const session = loadLocalSession();
+    const participantId = state.authUid;
+    const color = pickColor(participantId);
+
+    if (!session.adminUid) {
+      session.adminUid = participantId;
+    }
+
+    session.participants[participantId] = {
+      name,
+      objectType,
+      color,
+      tripCount: 0,
+      totalDistanceKm: 0,
+      longestTripDistanceKm: 0,
+      sessionVersion: session.sessionVersion,
+    };
+
+    session.participantTrips[participantId] = {
+      trips: [],
+      sessionVersion: session.sessionVersion,
+    };
+
+    saveLocalSession(session);
+    return;
+  }
+
   const participantId = state.authUid;
   const participantRef = doc(participantsCollectionRef, participantId);
   const participantTripsRef = doc(participantTripsCollectionRef, participantId);
@@ -446,6 +595,43 @@ async function joinRound(name, objectType) {
 }
 
 async function handleStartTimer() {
+  if (state.runtimeMode === "local") {
+    if (!isAdminUser()) {
+      return;
+    }
+
+    const session = loadLocalSession();
+    if (session.adminUid !== state.authUid || session.isRoundActive) {
+      return;
+    }
+
+    if (session.roundResult) {
+      session.adminUid = null;
+      session.isRoundActive = false;
+      session.roundEndsAtMs = null;
+      session.roundResult = null;
+      session.roundNumber += 1;
+      session.sessionVersion += 1;
+      session.participants = {};
+      session.participantTrips = {};
+      saveLocalSession(session);
+      return;
+    }
+
+    const activeParticipantIds = Object.keys(session.participants).filter(
+      (participantId) => session.participants[participantId].sessionVersion === session.sessionVersion,
+    );
+    if (activeParticipantIds.length === 0) {
+      return;
+    }
+
+    session.isRoundActive = true;
+    session.roundEndsAtMs = Date.now() + 60000;
+    session.roundResult = null;
+    saveLocalSession(session);
+    return;
+  }
+
   if (!isAdminUser()) {
     return;
   }
@@ -500,6 +686,28 @@ async function handleStartTimer() {
 }
 
 async function clearPlayersForNextRound() {
+  if (state.runtimeMode === "local") {
+    if (!isAdminUser()) {
+      return;
+    }
+
+    const session = loadLocalSession();
+    if (session.adminUid !== state.authUid) {
+      return;
+    }
+
+    session.adminUid = null;
+    session.isRoundActive = false;
+    session.roundEndsAtMs = null;
+    session.roundResult = null;
+    session.roundNumber += 1;
+    session.sessionVersion += 1;
+    session.participants = {};
+    session.participantTrips = {};
+    saveLocalSession(session);
+    return;
+  }
+
   if (!isAdminUser()) {
     return;
   }
@@ -532,6 +740,45 @@ async function clearPlayersForNextRound() {
 }
 
 async function addTrip(start, endLatLng) {
+  if (state.runtimeMode === "local") {
+    const session = loadLocalSession();
+    const participantId = state.authUid;
+    const participant = session.participants[participantId];
+    const participantTrips = session.participantTrips[participantId];
+    if (!session.isRoundActive || !participant || !participantTrips) {
+      return;
+    }
+
+    if (participant.sessionVersion !== session.sessionVersion || participantTrips.sessionVersion !== session.sessionVersion) {
+      return;
+    }
+
+    const trips = [...(participantTrips.trips || [])];
+    if (trips.length >= (session.maxTripsPerPlayer || MAX_TRIPS_PER_PLAYER)) {
+      return;
+    }
+
+    const end = { lat: endLatLng.lat, lng: endLatLng.lng };
+    const distanceKm = haversineKm(start.lat, start.lng, end.lat, end.lng);
+    trips.push({ start, end, distanceKm });
+    const summary = buildTripSummary(trips);
+
+    session.participantTrips[participantId] = {
+      trips,
+      sessionVersion: session.sessionVersion,
+    };
+    session.participants[participantId] = {
+      ...participant,
+      tripCount: summary.tripCount,
+      totalDistanceKm: summary.totalDistanceKm,
+      longestTripDistanceKm: summary.longestTripDistanceKm,
+      sessionVersion: session.sessionVersion,
+    };
+
+    saveLocalSession(session);
+    return;
+  }
+
   const participantId = state.authUid;
   const participantRef = doc(participantsCollectionRef, participantId);
   const participantTripsRef = doc(participantTripsCollectionRef, participantId);
@@ -593,6 +840,38 @@ async function addTrip(start, endLatLng) {
 }
 
 async function deleteLastTrip() {
+  if (state.runtimeMode === "local") {
+    const session = loadLocalSession();
+    const participantId = state.authUid;
+    const participant = session.participants[participantId];
+    const participantTrips = session.participantTrips[participantId];
+    if (!session.isRoundActive || !participant || !participantTrips) {
+      return;
+    }
+
+    const trips = [...(participantTrips.trips || [])];
+    if (trips.length === 0) {
+      return;
+    }
+
+    trips.pop();
+    const summary = buildTripSummary(trips);
+    session.participantTrips[participantId] = {
+      trips,
+      sessionVersion: session.sessionVersion,
+    };
+    session.participants[participantId] = {
+      ...participant,
+      tripCount: summary.tripCount,
+      totalDistanceKm: summary.totalDistanceKm,
+      longestTripDistanceKm: summary.longestTripDistanceKm,
+      sessionVersion: session.sessionVersion,
+    };
+
+    saveLocalSession(session);
+    return;
+  }
+
   const me = getMe();
   if (!me || me.tripCount <= 0) {
     return;
@@ -647,6 +926,41 @@ async function deleteLastTrip() {
 }
 
 async function maybeFinalizeRound() {
+  if (state.runtimeMode === "local") {
+    if (!isAdminUser() || !state.isRoundActive || !state.roundEndsAtMs || state.finalizeInFlight) {
+      return;
+    }
+
+    if (Date.now() < state.roundEndsAtMs) {
+      return;
+    }
+
+    state.finalizeInFlight = true;
+    try {
+      const session = loadLocalSession();
+      if (session.adminUid !== state.authUid || !session.isRoundActive) {
+        return;
+      }
+
+      const participantSummaries = Object.entries(session.participants)
+        .filter(([, participant]) => participant.sessionVersion === session.sessionVersion)
+        .map(([participantId, participant]) => ({
+          id: participantId,
+          name: participant.name,
+          tripCount: participant.tripCount || 0,
+          longestTripDistanceKm: participant.longestTripDistanceKm || 0,
+        }));
+
+      session.isRoundActive = false;
+      session.roundEndsAtMs = null;
+      session.roundResult = calculateRoundResult(participantSummaries);
+      saveLocalSession(session);
+    } finally {
+      state.finalizeInFlight = false;
+    }
+    return;
+  }
+
   if (!isAdminUser() || !state.isRoundActive || !state.roundEndsAtMs || state.finalizeInFlight) {
     return;
   }
