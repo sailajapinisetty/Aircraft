@@ -43,6 +43,7 @@ const ui = {
   startTimerBtn: document.getElementById("startTimerBtn"),
   adminStatusBadge: document.getElementById("adminStatusBadge"),
   timerDisplay: document.getElementById("timerDisplay"),
+  runtimeBanner: document.getElementById("runtimeBanner"),
   mapHint: document.getElementById("mapHint"),
   results: document.getElementById("results"),
   clearStartBtn: document.getElementById("clearStartBtn"),
@@ -62,6 +63,7 @@ const state = {
   roundNumber: 1,
   sessionVersion: 1,
   adminUid: null,
+  runtimeMessage: "",
   pendingStart: null,
   pendingStartMarker: null,
   drawnLayers: [],
@@ -229,6 +231,7 @@ async function initializeRealtimeApp() {
 function initializeLocalDemoMode(message) {
   state.runtimeMode = "local";
   state.authUid = getOrCreateLocalUid();
+  state.runtimeMessage = message || "Local demo mode active. This browser shares the round across tabs only. Add real Firebase config for shared GitHub Pages multiplayer.";
   restoreProfileOrPrompt();
   applyLocalSession(loadLocalSession());
 
@@ -376,6 +379,7 @@ function subscribeSession() {
       state.roundNumber = data.roundNumber || 1;
       state.sessionVersion = data.sessionVersion || 1;
       state.adminUid = data.adminUid || null;
+      state.runtimeMessage = "Shared live mode active. Participants on different devices join the same round.";
 
       if (!state.isRoundActive) {
         clearPendingStart();
@@ -1042,6 +1046,7 @@ function toggleJoinModal(show) {
 
 function renderAll() {
   attachVisibleTrips();
+  renderRuntimeBanner();
   renderParticipantChips();
   renderParticipantList();
   renderMapTrips();
@@ -1050,6 +1055,21 @@ function renderAll() {
   renderHint();
   renderTripControls();
   renderAdminControls();
+}
+
+function renderRuntimeBanner() {
+  if (!ui.runtimeBanner) {
+    return;
+  }
+
+  const isLocal = state.runtimeMode === "local";
+  const message = state.runtimeMessage || (isLocal
+    ? "Local demo mode active."
+    : "Shared live mode active.");
+
+  ui.runtimeBanner.hidden = false;
+  ui.runtimeBanner.textContent = message;
+  ui.runtimeBanner.classList.toggle("is-live", !isLocal);
 }
 
 function renderTripControls() {

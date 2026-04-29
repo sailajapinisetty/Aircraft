@@ -124,6 +124,25 @@ h2 {
   gap: 1rem;
 }
 
+.runtime-banner {
+  margin-top: 0.9rem;
+  padding: 0.8rem 1rem;
+  border-radius: 14px;
+  border: 1px solid rgba(116, 79, 0, 0.22);
+  background: rgba(246, 197, 79, 0.18);
+  color: #4a2d00;
+  box-shadow: var(--shadow);
+  font-size: 0.95rem;
+  font-weight: 600;
+  animation: fade-up 0.7s ease;
+}
+
+.runtime-banner.is-live {
+  border-color: rgba(15, 157, 141, 0.2);
+  background: rgba(15, 157, 141, 0.14);
+  color: #0a4f48;
+}
+
 .map-panel,
 .panel {
   background: var(--surface);
