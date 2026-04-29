@@ -83,10 +83,18 @@ let participantTripsCollectionRef;
 bindUiEvents();
 
 if (!isFirebaseConfigReady()) {
-  initializeLocalDemoMode();
+  if (canUseLocalDemoMode()) {
+    initializeLocalDemoMode();
+  } else {
+    renderSetupError("Shared multiplayer requires Firebase configuration. Add real values in firebase-config.js to keep the first player as the only admin across devices.");
+  }
 } else {
   initializeRealtimeApp().catch((error) => {
-    initializeLocalDemoMode(`Firebase unavailable. Falling back to local demo mode: ${error.message}`);
+    if (canUseLocalDemoMode()) {
+      initializeLocalDemoMode(`Firebase unavailable. Falling back to local demo mode: ${error.message}`);
+    } else {
+      renderSetupError(`Shared multiplayer is unavailable: ${error.message}`);
+    }
   });
 }
 
@@ -1379,6 +1387,12 @@ function isFirebaseConfigReady() {
       && FIREBASE_CONFIG.projectId
       && !FIREBASE_CONFIG.projectId.startsWith("YOUR_"),
   );
+}
+
+function canUseLocalDemoMode() {
+  return window.location.protocol === "file:"
+    || window.location.hostname === "localhost"
+    || window.location.hostname === "127.0.0.1";
 }
 
 function renderSetupError(message) {
