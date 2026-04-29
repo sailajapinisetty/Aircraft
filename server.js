@@ -18,6 +18,7 @@ const gameState = {
   isRoundActive: false,
   roundEndsAtMs: null,
   roundResult: null,
+  roundNumber: 1,
   timerIntervalId: null,
   roundTimeoutId: null,
 };
@@ -72,6 +73,7 @@ io.on("connection", (socket) => {
     if (gameState.roundResult !== null) {
       gameState.participants = [];
       gameState.roundResult = null;
+      gameState.roundNumber += 1;
       broadcastState();
       return;
     }
@@ -139,6 +141,7 @@ io.on("connection", (socket) => {
     gameState.roundResult = null;
     gameState.roundEndsAtMs = null;
     gameState.adminSocketId = null;
+    gameState.roundNumber += 1;
 
     if (gameState.roundTimeoutId) {
       clearTimeout(gameState.roundTimeoutId);
@@ -192,6 +195,7 @@ function publicStateFor(socketId) {
     isRoundActive: gameState.isRoundActive,
     roundEndsAtMs: gameState.roundEndsAtMs,
     roundResult: gameState.roundResult,
+    roundNumber: gameState.roundNumber,
     maxTripsPerPlayer: MAX_TRIPS_PER_PLAYER,
   };
 }

@@ -1,23 +1,3 @@
-import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
-import { getAuth, onAuthStateChanged, signInAnonymously } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
-import {
-  collection,
-  doc,
-  getDocs,
-  getFirestore,
-  onSnapshot,
-  query,
-  runTransaction,
-  serverTimestamp,
-  where,
-} from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
-import { FIREBASE_CONFIG, SESSION_ID } from "./firebase-config.js";
-
-const MAX_TRIPS_PER_PLAYER = 50;
-const colors = ["#ef6f6c", "#0f9d8d", "#f2a541", "#7b9acc", "#d17ab4", "#84b35a"];
-const LOCAL_SESSION_KEY = "trip-sprint-local-session";
-const LOCAL_UID_KEY = "trip-sprint-local-uid";
-
 const map = L.map("map", {
   worldCopyJump: true,
   minZoom: 1,
@@ -30,6 +10,22 @@ L.tileLayer("https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r
   attribution:
     '&copy; OpenStreetMap contributors &copy; <a href="https://carto.com/attributions">CARTO</a>',
 }).addTo(map);
+
+const socket = io();
+
+const state = {
+  participants: [],
+  isRoundActive: false,
+  roundEndsAtMs: null,
+  roundResult: null,
+  maxTripsPerPlayer: 50,
+  roundNumber: 1,
+  meSocketId: null,
+  runtimeMessage: "Connecting to shared live server...",
+  pendingStart: null,
+  pendingStartMarker: null,
+  drawnLayers: [],
+};
 
 const ui = {
   joinBtn: document.getElementById("joinBtn"),
@@ -51,984 +47,130 @@ const ui = {
   clearResultsBtn: document.getElementById("clearResultsBtn"),
 };
 
-const state = {
-  runtimeMode: "firebase",
-  authUid: null,
-  participants: [],
-  visibleTripsByUid: {},
-  isRoundActive: false,
-  roundEndsAtMs: null,
-  roundResult: null,
-  maxTripsPerPlayer: MAX_TRIPS_PER_PLAYER,
-  roundNumber: 1,
-  sessionVersion: 1,
-  adminUid: null,
-  runtimeMessage: "",
-  pendingStart: null,
-  pendingStartMarker: null,
-  drawnLayers: [],
-  finalizeInFlight: false,
-  unsubscribeSession: null,
-  unsubscribeParticipants: null,
-  unsubscribeTrips: null,
-  tripSubscriptionKey: null,
-};
-
-let db;
-let auth;
-let sessionRef;
-let participantsCollectionRef;
-let participantTripsCollectionRef;
-
-bindUiEvents();
-
-if (!isFirebaseConfigReady()) {
-  if (canUseLocalDemoMode()) {
-    initializeLocalDemoMode();
-  } else {
-    renderSetupError("Shared multiplayer requires Firebase configuration. Add real values in firebase-config.js to keep the first player as the only admin across devices.");
+ui.joinBtn.addEventListener("click", () => toggleJoinModal(true));
+ui.cancelJoinBtn.addEventListener("click", () => toggleJoinModal(false));
+ui.joinModal.addEventListener("click", (event) => {
+  if (event.target === ui.joinModal) {
+    toggleJoinModal(false);
   }
-} else {
-  initializeRealtimeApp().catch((error) => {
-    if (canUseLocalDemoMode()) {
-      initializeLocalDemoMode(`Firebase unavailable. Falling back to local demo mode: ${error.message}`);
-    } else {
-      renderSetupError(`Shared multiplayer is unavailable: ${error.message}`);
-    }
-  });
-}
+});
 
-setInterval(() => {
-  renderTimer();
-  void maybeFinalizeRound();
-}, 250);
+ui.joinForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  const name = ui.participantName.value.trim();
+  const objectType = ui.participantObject.value;
+  if (!name) {
+    return;
+  }
 
-function bindUiEvents() {
-  ui.joinBtn.addEventListener("click", () => toggleJoinModal(true));
-  ui.cancelJoinBtn.addEventListener("click", () => toggleJoinModal(false));
-  ui.joinModal.addEventListener("click", (event) => {
-    if (event.target === ui.joinModal) {
-      toggleJoinModal(false);
-    }
-  });
+  socket.emit("player:join", { name, objectType });
+  localStorage.setItem("trip-sprint-name", name);
+  localStorage.setItem("trip-sprint-object", objectType);
+  toggleJoinModal(false);
+});
 
-  ui.joinForm.addEventListener("submit", async (event) => {
-    event.preventDefault();
-    const name = ui.participantName.value.trim();
-    const objectType = ui.participantObject.value;
-    if (!name || !state.authUid) {
-      return;
-    }
+ui.startTimerBtn.addEventListener("click", () => {
+  socket.emit("round:start");
+});
 
-    try {
-      await joinRound(name, objectType);
-      localStorage.setItem("trip-sprint-name", name);
-      localStorage.setItem("trip-sprint-object", objectType);
-      toggleJoinModal(false);
-    } catch (error) {
-      ui.mapHint.textContent = `Join failed: ${error.message}`;
-    }
-  });
+ui.clearStartBtn.addEventListener("click", () => {
+  clearPendingStart();
+  renderAll();
+});
 
-  ui.startTimerBtn.addEventListener("click", async () => {
-    try {
-      await handleStartTimer();
-    } catch (error) {
-      ui.mapHint.textContent = `Unable to change round state: ${error.message}`;
-    }
-  });
+ui.deleteLastTripBtn.addEventListener("click", () => {
+  const me = getMe();
+  if (me && me.trips.length > 0) {
+    socket.emit("trip:delete", { tripIndex: me.trips.length - 1 });
+  }
+});
 
-  ui.clearStartBtn.addEventListener("click", () => {
+ui.clearResultsBtn.addEventListener("click", () => {
+  socket.emit("round:clearPlayers");
+});
+
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && state.pendingStart) {
     clearPendingStart();
     renderAll();
-  });
+  }
 
-  ui.deleteLastTripBtn.addEventListener("click", async () => {
-    try {
-      await deleteLastTrip();
-    } catch (error) {
-      ui.mapHint.textContent = `Could not delete trip: ${error.message}`;
-    }
-  });
-
-  ui.clearResultsBtn.addEventListener("click", async () => {
-    try {
-      await clearPlayersForNextRound();
-    } catch (error) {
-      ui.mapHint.textContent = `Could not clear players: ${error.message}`;
-    }
-  });
-
-  document.addEventListener("keydown", async (event) => {
-    if (event.key === "Escape" && state.pendingStart) {
-      clearPendingStart();
-      renderAll();
-    }
-
-    if (event.key === "Backspace" && state.isRoundActive) {
-      event.preventDefault();
-      try {
-        await deleteLastTrip();
-      } catch (error) {
-        ui.mapHint.textContent = `Could not delete trip: ${error.message}`;
-      }
-    }
-  });
-
-  map.on("click", async (event) => {
-    if (!state.isRoundActive) {
-      return;
-    }
-
+  if (event.key === "Backspace" && state.isRoundActive) {
+    event.preventDefault();
     const me = getMe();
-    if (!me) {
-      ui.mapHint.textContent = "Join first with your name and pin before adding trips.";
-      toggleJoinModal(true);
-      return;
+    if (me && me.trips.length > 0) {
+      socket.emit("trip:delete", { tripIndex: me.trips.length - 1 });
     }
+  }
+});
 
-    if (me.tripCount >= state.maxTripsPerPlayer) {
-      clearPendingStart();
-      ui.mapHint.textContent = `You reached the maximum of ${state.maxTripsPerPlayer} trips for this round.`;
-      return;
-    }
+map.on("click", (event) => {
+  if (!state.isRoundActive) {
+    return;
+  }
 
-    if (!state.pendingStart) {
-      state.pendingStart = event.latlng;
-      state.pendingStartMarker = L.marker(event.latlng, {
-        icon: L.divIcon({
-          className: "temp-start-marker",
-          iconSize: [14, 14],
-        }),
-      }).addTo(map);
-      ui.mapHint.textContent = "Start point set. Click again to place the end point.";
-      return;
-    }
+  const me = getMe();
+  if (!me) {
+    ui.mapHint.textContent = "Join first with your name and pin before adding trips.";
+    toggleJoinModal(true);
+    return;
+  }
 
-    try {
-      await addTrip({ lat: state.pendingStart.lat, lng: state.pendingStart.lng }, event.latlng);
-      clearPendingStart();
-      ui.mapHint.textContent = "Trip submitted. Add another start and end point.";
-    } catch (error) {
-      ui.mapHint.textContent = `Could not add trip: ${error.message}`;
-    }
+  if (me.trips.length >= state.maxTripsPerPlayer) {
+    clearPendingStart();
+    ui.mapHint.textContent = `You reached the maximum of ${state.maxTripsPerPlayer} trips for this round.`;
+    return;
+  }
+
+  if (!state.pendingStart) {
+    state.pendingStart = event.latlng;
+    state.pendingStartMarker = L.marker(event.latlng, {
+      icon: L.divIcon({
+        className: "temp-start-marker",
+        iconSize: [14, 14],
+      }),
+    }).addTo(map);
+    ui.mapHint.textContent = "Start point set. Click again to place the end point.";
+    return;
+  }
+
+  socket.emit("trip:add", {
+    start: { lat: state.pendingStart.lat, lng: state.pendingStart.lng },
+    end: { lat: event.latlng.lat, lng: event.latlng.lng },
   });
-}
 
-async function initializeRealtimeApp() {
-  const app = initializeApp(FIREBASE_CONFIG);
-  auth = getAuth(app);
-  db = getFirestore(app);
-  sessionRef = doc(db, "sessions", SESSION_ID);
-  participantsCollectionRef = collection(db, "sessions", SESSION_ID, "participants");
-  participantTripsCollectionRef = collection(db, "sessions", SESSION_ID, "participantTrips");
+  clearPendingStart();
+  ui.mapHint.textContent = "Trip submitted. Add another start and end point.";
+});
 
-  await signInAnonymously(auth);
-
-  onAuthStateChanged(auth, (user) => {
-    if (!user) {
-      return;
-    }
-
-    state.authUid = user.uid;
-    subscribeSession();
-    restoreProfileOrPrompt();
-  });
-}
-
-function initializeLocalDemoMode(message) {
-  state.runtimeMode = "local";
-  state.authUid = getOrCreateLocalUid();
-  state.runtimeMessage = message || "Local demo mode active. This browser shares the round across tabs only. Add real Firebase config for shared GitHub Pages multiplayer.";
+socket.on("connect", () => {
+  state.meSocketId = socket.id;
+  state.runtimeMessage = "Shared live server active. Share this deployed server URL with players.";
   restoreProfileOrPrompt();
-  applyLocalSession(loadLocalSession());
+  renderRuntimeBanner();
+});
 
-  if (message) {
-    ui.mapHint.textContent = message;
-  } else {
-    ui.mapHint.textContent = "Local demo mode active. Join works locally and syncs across tabs on this browser.";
-  }
+socket.on("disconnect", () => {
+  state.runtimeMessage = "Connection lost. Waiting to reconnect to the shared live server.";
+  renderRuntimeBanner();
+});
 
-  window.addEventListener("storage", (event) => {
-    if (event.key === LOCAL_SESSION_KEY) {
-      applyLocalSession(loadLocalSession());
-    }
-  });
-}
-
-function getOrCreateLocalUid() {
-  const existingUid = localStorage.getItem(LOCAL_UID_KEY);
-  if (existingUid) {
-    return existingUid;
-  }
-
-  const nextUid = `local-${crypto.randomUUID()}`;
-  localStorage.setItem(LOCAL_UID_KEY, nextUid);
-  return nextUid;
-}
-
-function createEmptyLocalSession() {
-  return {
-    adminUid: null,
-    isRoundActive: false,
-    roundEndsAtMs: null,
-    roundResult: null,
-    maxTripsPerPlayer: MAX_TRIPS_PER_PLAYER,
-    roundNumber: 1,
-    sessionVersion: 1,
-    participants: {},
-    participantTrips: {},
-  };
-}
-
-function loadLocalSession() {
-  const rawValue = localStorage.getItem(LOCAL_SESSION_KEY);
-  if (!rawValue) {
-    return createEmptyLocalSession();
-  }
-
-  try {
-    const parsed = JSON.parse(rawValue);
-    return {
-      ...createEmptyLocalSession(),
-      ...parsed,
-      participants: parsed.participants || {},
-      participantTrips: parsed.participantTrips || {},
-    };
-  } catch {
-    return createEmptyLocalSession();
-  }
-}
-
-function saveLocalSession(session) {
-  localStorage.setItem(LOCAL_SESSION_KEY, JSON.stringify(session));
-  applyLocalSession(session);
-}
-
-function applyLocalSession(session) {
-  state.isRoundActive = Boolean(session.isRoundActive);
-  state.roundEndsAtMs = session.roundEndsAtMs || null;
-  state.roundResult = session.roundResult || null;
-  state.maxTripsPerPlayer = session.maxTripsPerPlayer || MAX_TRIPS_PER_PLAYER;
-  state.roundNumber = session.roundNumber || 1;
-  state.sessionVersion = session.sessionVersion || 1;
-  state.adminUid = session.adminUid || null;
-
-  const visibleTripsByUid = {};
-  const participants = Object.entries(session.participants || {})
-    .map(([participantId, participant]) => {
-      const participantTrips = session.participantTrips?.[participantId];
-      const trips = participantTrips && participantTrips.sessionVersion === state.sessionVersion
-        ? participantTrips.trips || []
-        : [];
-
-      if (participantId === state.authUid || participantId === state.adminUid) {
-        visibleTripsByUid[participantId] = isAdminUser()
-          ? trips
-          : participantId === state.authUid
-            ? trips
-            : [];
-      } else if (isAdminUser()) {
-        visibleTripsByUid[participantId] = trips;
-      }
-
-      return {
-        id: participantId,
-        name: participant.name,
-        objectType: participant.objectType,
-        color: participant.color,
-        tripCount: participant.tripCount || 0,
-        totalDistanceKm: participant.totalDistanceKm || 0,
-        longestTripDistanceKm: participant.longestTripDistanceKm || 0,
-        isAdmin: participantId === session.adminUid,
-        trips: [],
-      };
-    })
-    .filter((participant) => participant.sessionVersion !== 0)
-    .sort((left, right) => left.name.localeCompare(right.name));
-
-  state.visibleTripsByUid = visibleTripsByUid;
-  state.participants = participants;
+socket.on("state:update", (serverState) => {
+  state.participants = serverState.participants || [];
+  state.isRoundActive = Boolean(serverState.isRoundActive);
+  state.roundEndsAtMs = serverState.roundEndsAtMs || null;
+  state.roundResult = serverState.roundResult || null;
+  state.roundNumber = serverState.roundNumber || 1;
+  state.maxTripsPerPlayer = serverState.maxTripsPerPlayer || 50;
 
   if (!state.isRoundActive) {
     clearPendingStart();
   }
 
   renderAll();
-}
+});
 
-function subscribeSession() {
-  if (state.unsubscribeSession) {
-    state.unsubscribeSession();
-  }
-
-  state.unsubscribeSession = onSnapshot(
-    sessionRef,
-    (snapshot) => {
-      if (!snapshot.exists()) {
-        state.isRoundActive = false;
-        state.roundEndsAtMs = null;
-        state.roundResult = null;
-        state.maxTripsPerPlayer = MAX_TRIPS_PER_PLAYER;
-        state.roundNumber = 1;
-        state.sessionVersion = 1;
-        state.adminUid = null;
-        syncParticipantsSubscription();
-        syncTripsSubscription();
-        renderAll();
-        return;
-      }
-
-      const data = snapshot.data();
-      state.isRoundActive = Boolean(data.isRoundActive);
-      state.roundEndsAtMs = data.roundEndsAtMs || null;
-      state.roundResult = data.roundResult || null;
-      state.maxTripsPerPlayer = data.maxTripsPerPlayer || MAX_TRIPS_PER_PLAYER;
-      state.roundNumber = data.roundNumber || 1;
-      state.sessionVersion = data.sessionVersion || 1;
-      state.adminUid = data.adminUid || null;
-      state.runtimeMessage = "Shared live mode active. Participants on different devices join the same round.";
-
-      if (!state.isRoundActive) {
-        clearPendingStart();
-      }
-
-      syncParticipantsSubscription();
-      syncTripsSubscription();
-      renderAll();
-      void maybeFinalizeRound();
-    },
-    (error) => {
-      renderSetupError(`Realtime session unavailable: ${error.message}`);
-    },
-  );
-}
-
-function syncParticipantsSubscription() {
-  if (!participantsCollectionRef) {
-    return;
-  }
-
-  if (state.unsubscribeParticipants) {
-    state.unsubscribeParticipants();
-  }
-
-  const participantsQuery = query(participantsCollectionRef, where("sessionVersion", "==", state.sessionVersion));
-  state.unsubscribeParticipants = onSnapshot(participantsQuery, (snapshot) => {
-    const previousTrips = state.visibleTripsByUid;
-    state.participants = snapshot.docs
-      .map((participantDoc) => {
-        const data = participantDoc.data();
-        return {
-          id: participantDoc.id,
-          name: data.name,
-          objectType: data.objectType,
-          color: data.color,
-          tripCount: data.tripCount || 0,
-          totalDistanceKm: data.totalDistanceKm || 0,
-          longestTripDistanceKm: data.longestTripDistanceKm || 0,
-          isAdmin: participantDoc.id === state.adminUid,
-          trips: previousTrips[participantDoc.id] || [],
-        };
-      })
-      .sort((left, right) => left.name.localeCompare(right.name));
-
-    syncTripsSubscription();
-    renderAll();
-  });
-}
-
-function syncTripsSubscription() {
-  if (!participantTripsCollectionRef || !state.authUid) {
-    return;
-  }
-
-  const isAdmin = isAdminUser();
-  const nextKey = `${state.sessionVersion}:${isAdmin ? "admin" : "self"}:${state.authUid}`;
-
-  if (state.tripSubscriptionKey === nextKey) {
-    return;
-  }
-
-  state.tripSubscriptionKey = nextKey;
-
-  if (state.unsubscribeTrips) {
-    state.unsubscribeTrips();
-  }
-
-  state.visibleTripsByUid = {};
-
-  if (isAdmin) {
-    const tripsQuery = query(participantTripsCollectionRef, where("sessionVersion", "==", state.sessionVersion));
-    state.unsubscribeTrips = onSnapshot(tripsQuery, (snapshot) => {
-      const nextTripsByUid = {};
-      snapshot.forEach((tripDoc) => {
-        nextTripsByUid[tripDoc.id] = tripDoc.data().trips || [];
-      });
-      state.visibleTripsByUid = nextTripsByUid;
-      attachVisibleTrips();
-      renderAll();
-    });
-    return;
-  }
-
-  state.unsubscribeTrips = onSnapshot(doc(participantTripsCollectionRef, state.authUid), (snapshot) => {
-    const nextTripsByUid = {};
-    if (snapshot.exists()) {
-      const data = snapshot.data();
-      if (data.sessionVersion === state.sessionVersion) {
-        nextTripsByUid[state.authUid] = data.trips || [];
-      }
-    }
-    state.visibleTripsByUid = nextTripsByUid;
-    attachVisibleTrips();
-    renderAll();
-  });
-}
-
-function attachVisibleTrips() {
-  state.participants = state.participants.map((participant) => ({
-    ...participant,
-    trips: state.visibleTripsByUid[participant.id] || [],
-    isAdmin: participant.id === state.adminUid,
-  }));
-}
-
-async function joinRound(name, objectType) {
-  if (state.runtimeMode === "local") {
-    const session = loadLocalSession();
-    const participantId = state.authUid;
-    const color = pickColor(participantId);
-
-    if (!session.adminUid) {
-      session.adminUid = participantId;
-    }
-
-    session.participants[participantId] = {
-      name,
-      objectType,
-      color,
-      tripCount: 0,
-      totalDistanceKm: 0,
-      longestTripDistanceKm: 0,
-      sessionVersion: session.sessionVersion,
-    };
-
-    session.participantTrips[participantId] = {
-      trips: [],
-      sessionVersion: session.sessionVersion,
-    };
-
-    saveLocalSession(session);
-    return;
-  }
-
-  const participantId = state.authUid;
-  const participantRef = doc(participantsCollectionRef, participantId);
-  const participantTripsRef = doc(participantTripsCollectionRef, participantId);
-  const color = pickColor(participantId);
-
-  await runTransaction(db, async (transaction) => {
-    const sessionSnapshot = await transaction.get(sessionRef);
-
-    let sessionData;
-    if (!sessionSnapshot.exists()) {
-      sessionData = {
-        adminUid: participantId,
-        isRoundActive: false,
-        roundEndsAtMs: null,
-        roundResult: null,
-        maxTripsPerPlayer: MAX_TRIPS_PER_PLAYER,
-        roundNumber: 1,
-        sessionVersion: 1,
-        updatedAt: serverTimestamp(),
-      };
-      transaction.set(sessionRef, sessionData);
-    } else {
-      sessionData = sessionSnapshot.data();
-      const sessionPatch = {};
-      if (!sessionData.maxTripsPerPlayer) {
-        sessionPatch.maxTripsPerPlayer = MAX_TRIPS_PER_PLAYER;
-      }
-      if (!sessionData.roundNumber) {
-        sessionPatch.roundNumber = 1;
-      }
-      if (!sessionData.sessionVersion) {
-        sessionPatch.sessionVersion = 1;
-      }
-      if (!sessionData.adminUid) {
-        sessionPatch.adminUid = participantId;
-      }
-      if (Object.keys(sessionPatch).length > 0) {
-        sessionPatch.updatedAt = serverTimestamp();
-        transaction.set(sessionRef, sessionPatch, { merge: true });
-        sessionData = { ...sessionData, ...sessionPatch };
-      }
-    }
-
-    const currentSessionVersion = sessionData.sessionVersion || 1;
-    const publicSnapshot = await transaction.get(participantRef);
-    const publicData = publicSnapshot.exists() ? publicSnapshot.data() : null;
-    const sameSession = publicData && publicData.sessionVersion === currentSessionVersion;
-
-    const participantBase = {
-      name,
-      objectType,
-      color,
-      sessionVersion: currentSessionVersion,
-      updatedAt: serverTimestamp(),
-    };
-
-    if (sameSession) {
-      transaction.set(participantRef, participantBase, { merge: true });
-    } else {
-      transaction.set(
-        participantRef,
-        {
-          ...participantBase,
-          tripCount: 0,
-          totalDistanceKm: 0,
-          longestTripDistanceKm: 0,
-        },
-        { merge: true },
-      );
-
-      transaction.set(
-        participantTripsRef,
-        {
-          trips: [],
-          sessionVersion: currentSessionVersion,
-          updatedAt: serverTimestamp(),
-        },
-        { merge: true },
-      );
-    }
-  });
-}
-
-async function handleStartTimer() {
-  if (state.runtimeMode === "local") {
-    if (!isAdminUser()) {
-      return;
-    }
-
-    const session = loadLocalSession();
-    if (session.adminUid !== state.authUid || session.isRoundActive) {
-      return;
-    }
-
-    if (session.roundResult) {
-      session.adminUid = null;
-      session.isRoundActive = false;
-      session.roundEndsAtMs = null;
-      session.roundResult = null;
-      session.roundNumber += 1;
-      session.sessionVersion += 1;
-      session.participants = {};
-      session.participantTrips = {};
-      saveLocalSession(session);
-      return;
-    }
-
-    const activeParticipantIds = Object.keys(session.participants).filter(
-      (participantId) => session.participants[participantId].sessionVersion === session.sessionVersion,
-    );
-    if (activeParticipantIds.length === 0) {
-      return;
-    }
-
-    session.isRoundActive = true;
-    session.roundEndsAtMs = Date.now() + 60000;
-    session.roundResult = null;
-    saveLocalSession(session);
-    return;
-  }
-
-  if (!isAdminUser()) {
-    return;
-  }
-
-  const activeParticipantsSnapshot = await getDocs(
-    query(participantsCollectionRef, where("sessionVersion", "==", state.sessionVersion)),
-  );
-
-  await runTransaction(db, async (transaction) => {
-    const sessionSnapshot = await transaction.get(sessionRef);
-    if (!sessionSnapshot.exists()) {
-      return;
-    }
-
-    const sessionData = sessionSnapshot.data();
-    if (sessionData.adminUid !== state.authUid || sessionData.isRoundActive) {
-      return;
-    }
-
-    if (sessionData.roundResult) {
-      transaction.set(
-        sessionRef,
-        {
-          adminUid: null,
-          isRoundActive: false,
-          roundEndsAtMs: null,
-          roundResult: null,
-          roundNumber: (sessionData.roundNumber || 1) + 1,
-          sessionVersion: (sessionData.sessionVersion || 1) + 1,
-          updatedAt: serverTimestamp(),
-        },
-        { merge: true },
-      );
-      return;
-    }
-
-    if (activeParticipantsSnapshot.empty) {
-      return;
-    }
-
-    transaction.set(
-      sessionRef,
-      {
-        isRoundActive: true,
-        roundEndsAtMs: Date.now() + 60000,
-        roundResult: null,
-        updatedAt: serverTimestamp(),
-      },
-      { merge: true },
-    );
-  });
-}
-
-async function clearPlayersForNextRound() {
-  if (state.runtimeMode === "local") {
-    if (!isAdminUser()) {
-      return;
-    }
-
-    const session = loadLocalSession();
-    if (session.adminUid !== state.authUid) {
-      return;
-    }
-
-    session.adminUid = null;
-    session.isRoundActive = false;
-    session.roundEndsAtMs = null;
-    session.roundResult = null;
-    session.roundNumber += 1;
-    session.sessionVersion += 1;
-    session.participants = {};
-    session.participantTrips = {};
-    saveLocalSession(session);
-    return;
-  }
-
-  if (!isAdminUser()) {
-    return;
-  }
-
-  await runTransaction(db, async (transaction) => {
-    const sessionSnapshot = await transaction.get(sessionRef);
-    if (!sessionSnapshot.exists()) {
-      return;
-    }
-
-    const sessionData = sessionSnapshot.data();
-    if (sessionData.adminUid !== state.authUid) {
-      return;
-    }
-
-    transaction.set(
-      sessionRef,
-      {
-        adminUid: null,
-        isRoundActive: false,
-        roundEndsAtMs: null,
-        roundResult: null,
-        roundNumber: (sessionData.roundNumber || 1) + 1,
-        sessionVersion: (sessionData.sessionVersion || 1) + 1,
-        updatedAt: serverTimestamp(),
-      },
-      { merge: true },
-    );
-  });
-}
-
-async function addTrip(start, endLatLng) {
-  if (state.runtimeMode === "local") {
-    const session = loadLocalSession();
-    const participantId = state.authUid;
-    const participant = session.participants[participantId];
-    const participantTrips = session.participantTrips[participantId];
-    if (!session.isRoundActive || !participant || !participantTrips) {
-      return;
-    }
-
-    if (participant.sessionVersion !== session.sessionVersion || participantTrips.sessionVersion !== session.sessionVersion) {
-      return;
-    }
-
-    const trips = [...(participantTrips.trips || [])];
-    if (trips.length >= (session.maxTripsPerPlayer || MAX_TRIPS_PER_PLAYER)) {
-      return;
-    }
-
-    const end = { lat: endLatLng.lat, lng: endLatLng.lng };
-    const distanceKm = haversineKm(start.lat, start.lng, end.lat, end.lng);
-    trips.push({ start, end, distanceKm });
-    const summary = buildTripSummary(trips);
-
-    session.participantTrips[participantId] = {
-      trips,
-      sessionVersion: session.sessionVersion,
-    };
-    session.participants[participantId] = {
-      ...participant,
-      tripCount: summary.tripCount,
-      totalDistanceKm: summary.totalDistanceKm,
-      longestTripDistanceKm: summary.longestTripDistanceKm,
-      sessionVersion: session.sessionVersion,
-    };
-
-    saveLocalSession(session);
-    return;
-  }
-
-  const participantId = state.authUid;
-  const participantRef = doc(participantsCollectionRef, participantId);
-  const participantTripsRef = doc(participantTripsCollectionRef, participantId);
-  const end = { lat: endLatLng.lat, lng: endLatLng.lng };
-
-  await runTransaction(db, async (transaction) => {
-    const sessionSnapshot = await transaction.get(sessionRef);
-    const participantSnapshot = await transaction.get(participantRef);
-    const participantTripsSnapshot = await transaction.get(participantTripsRef);
-
-    if (!sessionSnapshot.exists() || !participantSnapshot.exists()) {
-      return;
-    }
-
-    const sessionData = sessionSnapshot.data();
-    const participantData = participantSnapshot.data();
-    const participantTripsData = participantTripsSnapshot.exists()
-      ? participantTripsSnapshot.data()
-      : { trips: [], sessionVersion: state.sessionVersion };
-
-    if (!sessionData.isRoundActive || participantData.sessionVersion !== sessionData.sessionVersion) {
-      return;
-    }
-
-    if (participantTripsData.sessionVersion !== sessionData.sessionVersion) {
-      return;
-    }
-
-    const trips = Array.isArray(participantTripsData.trips) ? [...participantTripsData.trips] : [];
-    if (trips.length >= (sessionData.maxTripsPerPlayer || MAX_TRIPS_PER_PLAYER)) {
-      return;
-    }
-
-    const distanceKm = haversineKm(start.lat, start.lng, end.lat, end.lng);
-    trips.push({ start, end, distanceKm });
-    const summary = buildTripSummary(trips);
-
-    transaction.set(
-      participantTripsRef,
-      {
-        trips,
-        sessionVersion: sessionData.sessionVersion,
-        updatedAt: serverTimestamp(),
-      },
-      { merge: true },
-    );
-
-    transaction.set(
-      participantRef,
-      {
-        tripCount: summary.tripCount,
-        totalDistanceKm: summary.totalDistanceKm,
-        longestTripDistanceKm: summary.longestTripDistanceKm,
-        updatedAt: serverTimestamp(),
-      },
-      { merge: true },
-    );
-  });
-}
-
-async function deleteLastTrip() {
-  if (state.runtimeMode === "local") {
-    const session = loadLocalSession();
-    const participantId = state.authUid;
-    const participant = session.participants[participantId];
-    const participantTrips = session.participantTrips[participantId];
-    if (!session.isRoundActive || !participant || !participantTrips) {
-      return;
-    }
-
-    const trips = [...(participantTrips.trips || [])];
-    if (trips.length === 0) {
-      return;
-    }
-
-    trips.pop();
-    const summary = buildTripSummary(trips);
-    session.participantTrips[participantId] = {
-      trips,
-      sessionVersion: session.sessionVersion,
-    };
-    session.participants[participantId] = {
-      ...participant,
-      tripCount: summary.tripCount,
-      totalDistanceKm: summary.totalDistanceKm,
-      longestTripDistanceKm: summary.longestTripDistanceKm,
-      sessionVersion: session.sessionVersion,
-    };
-
-    saveLocalSession(session);
-    return;
-  }
-
-  const me = getMe();
-  if (!me || me.tripCount <= 0) {
-    return;
-  }
-
-  const participantRef = doc(participantsCollectionRef, state.authUid);
-  const participantTripsRef = doc(participantTripsCollectionRef, state.authUid);
-
-  await runTransaction(db, async (transaction) => {
-    const sessionSnapshot = await transaction.get(sessionRef);
-    const participantTripsSnapshot = await transaction.get(participantTripsRef);
-
-    if (!sessionSnapshot.exists() || !participantTripsSnapshot.exists()) {
-      return;
-    }
-
-    const sessionData = sessionSnapshot.data();
-    const tripsData = participantTripsSnapshot.data();
-    if (!sessionData.isRoundActive || tripsData.sessionVersion !== sessionData.sessionVersion) {
-      return;
-    }
-
-    const trips = Array.isArray(tripsData.trips) ? [...tripsData.trips] : [];
-    if (trips.length === 0) {
-      return;
-    }
-
-    trips.pop();
-    const summary = buildTripSummary(trips);
-
-    transaction.set(
-      participantTripsRef,
-      {
-        trips,
-        sessionVersion: sessionData.sessionVersion,
-        updatedAt: serverTimestamp(),
-      },
-      { merge: true },
-    );
-
-    transaction.set(
-      participantRef,
-      {
-        tripCount: summary.tripCount,
-        totalDistanceKm: summary.totalDistanceKm,
-        longestTripDistanceKm: summary.longestTripDistanceKm,
-        updatedAt: serverTimestamp(),
-      },
-      { merge: true },
-    );
-  });
-}
-
-async function maybeFinalizeRound() {
-  if (state.runtimeMode === "local") {
-    if (!isAdminUser() || !state.isRoundActive || !state.roundEndsAtMs || state.finalizeInFlight) {
-      return;
-    }
-
-    if (Date.now() < state.roundEndsAtMs) {
-      return;
-    }
-
-    state.finalizeInFlight = true;
-    try {
-      const session = loadLocalSession();
-      if (session.adminUid !== state.authUid || !session.isRoundActive) {
-        return;
-      }
-
-      const participantSummaries = Object.entries(session.participants)
-        .filter(([, participant]) => participant.sessionVersion === session.sessionVersion)
-        .map(([participantId, participant]) => ({
-          id: participantId,
-          name: participant.name,
-          tripCount: participant.tripCount || 0,
-          longestTripDistanceKm: participant.longestTripDistanceKm || 0,
-        }));
-
-      session.isRoundActive = false;
-      session.roundEndsAtMs = null;
-      session.roundResult = calculateRoundResult(participantSummaries);
-      saveLocalSession(session);
-    } finally {
-      state.finalizeInFlight = false;
-    }
-    return;
-  }
-
-  if (!isAdminUser() || !state.isRoundActive || !state.roundEndsAtMs || state.finalizeInFlight) {
-    return;
-  }
-
-  if (Date.now() < state.roundEndsAtMs) {
-    return;
-  }
-
-  state.finalizeInFlight = true;
-  try {
-    const participantSnapshots = await getDocs(
-      query(participantsCollectionRef, where("sessionVersion", "==", state.sessionVersion)),
-    );
-
-    const summaries = participantSnapshots.docs.map((participantDoc) => {
-      const data = participantDoc.data();
-      return {
-        id: participantDoc.id,
-        name: data.name,
-        tripCount: data.tripCount || 0,
-        longestTripDistanceKm: data.longestTripDistanceKm || 0,
-      };
-    });
-
-    const roundResult = calculateRoundResult(summaries);
-
-    await runTransaction(db, async (transaction) => {
-      const sessionSnapshot = await transaction.get(sessionRef);
-      if (!sessionSnapshot.exists()) {
-        return;
-      }
-
-      const sessionData = sessionSnapshot.data();
-      if (sessionData.adminUid !== state.authUid || !sessionData.isRoundActive) {
-        return;
-      }
-
-      if (sessionData.roundEndsAtMs && sessionData.roundEndsAtMs > Date.now()) {
-        return;
-      }
-
-      transaction.set(
-        sessionRef,
-        {
-          isRoundActive: false,
-          roundEndsAtMs: null,
-          roundResult,
-          updatedAt: serverTimestamp(),
-        },
-        { merge: true },
-      );
-    });
-  } finally {
-    state.finalizeInFlight = false;
-  }
-}
+setInterval(renderTimer, 250);
 
 function restoreProfileOrPrompt() {
   const name = localStorage.getItem("trip-sprint-name") || "";
@@ -1039,8 +181,7 @@ function restoreProfileOrPrompt() {
     return;
   }
 
-  ui.participantName.value = name;
-  ui.participantObject.value = objectType;
+  socket.emit("player:join", { name, objectType });
 }
 
 function toggleJoinModal(show) {
@@ -1053,7 +194,6 @@ function toggleJoinModal(show) {
 }
 
 function renderAll() {
-  attachVisibleTrips();
   renderRuntimeBanner();
   renderParticipantChips();
   renderParticipantList();
@@ -1070,28 +210,24 @@ function renderRuntimeBanner() {
     return;
   }
 
-  const isLocal = state.runtimeMode === "local";
-  const message = state.runtimeMessage || (isLocal
-    ? "Local demo mode active."
-    : "Shared live mode active.");
-
   ui.runtimeBanner.hidden = false;
-  ui.runtimeBanner.textContent = message;
-  ui.runtimeBanner.classList.toggle("is-live", !isLocal);
+  ui.runtimeBanner.textContent = state.runtimeMessage;
+  ui.runtimeBanner.classList.toggle("is-live", socket.connected);
 }
 
 function renderTripControls() {
   const hasStartPoint = Boolean(state.pendingStart);
   const me = getMe();
-  const hasTrips = me && me.tripCount > 0;
+  const hasTrips = me && me.trips.length > 0;
 
   ui.clearStartBtn.hidden = !hasStartPoint;
   ui.deleteLastTripBtn.hidden = !hasTrips;
 }
 
 function renderAdminControls() {
-  const isAdmin = isAdminUser();
-  const admin = state.participants.find((participant) => participant.id === state.adminUid);
+  const me = getMe();
+  const isAdmin = me && me.isAdmin;
+  const admin = state.participants.find((participant) => participant.isAdmin);
 
   ui.clearResultsBtn.hidden = !isAdmin || state.isRoundActive;
   ui.startTimerBtn.hidden = !isAdmin;
@@ -1127,7 +263,7 @@ function renderParticipantChips() {
   state.participants.forEach((participant) => {
     const chip = document.createElement("span");
     chip.className = "participant-chip";
-    if (participant.id === state.authUid) {
+    if (participant.socketId === state.meSocketId) {
       chip.classList.add("active");
     }
 
@@ -1153,16 +289,19 @@ function renderParticipantList() {
 
   state.participants.forEach((participant) => {
     const item = document.createElement("li");
+    const totalDistance = participant.totalDistanceKm ?? participant.trips.reduce((sum, trip) => sum + trip.distanceKm, 0);
+    const tripCount = participant.tripCount ?? participant.trips.length;
+
     const badge = document.createElement("span");
     badge.className = "player-badge";
     badge.innerHTML = `
       <span class="marker-preview ${participant.objectType}" style="background:${participant.color};"></span>
-      ${escapeHtml(participant.name)}${participant.id === state.adminUid ? " 👑 Admin" : ""}${participant.id === state.authUid ? " (You)" : ""}
+      ${escapeHtml(participant.name)}${participant.isAdmin ? " 👑 Admin" : ""}${participant.socketId === state.meSocketId ? " (You)" : ""}
     `;
 
     const stats = document.createElement("span");
     stats.className = "player-stats";
-    stats.textContent = `${participant.tripCount}/${state.maxTripsPerPlayer} trips | ${participant.totalDistanceKm.toFixed(1)} km`;
+    stats.textContent = `${tripCount}/${state.maxTripsPerPlayer} trips | ${totalDistance.toFixed(1)} km`;
 
     item.appendChild(badge);
     item.appendChild(stats);
@@ -1193,24 +332,27 @@ function renderResults() {
   if (state.isRoundActive) {
     ui.results.classList.add("empty");
     ui.results.textContent = "Round in progress...";
+    ui.clearResultsBtn.hidden = true;
     return;
   }
 
   if (!state.roundResult) {
     ui.results.classList.add("empty");
     ui.results.textContent = "Results appear when timer reaches 00:00.";
+    ui.clearResultsBtn.hidden = true;
     return;
   }
 
   const { mostTripPlayers, highestCount, longestTripName, longestTripDistanceKm } = state.roundResult;
   ui.results.classList.remove("empty");
+  ui.clearResultsBtn.hidden = false;
 
   if (!mostTripPlayers.length) {
     ui.results.innerHTML = `
       <div style="text-align: center; padding: 1rem;">
         <h3 style="font-size: 1.3rem; margin: 0 0 0.5rem; color: #0f9d8d;">Round ${state.roundNumber} Completed</h3>
         <div style="color: #355a5f; margin-top: 0.5rem;">No trips were added this round.</div>
-        <div style="margin-top: 1rem; font-size: 0.9rem; color: #355a5f;">Admin can clear players and begin Round ${state.roundNumber + 1}</div>
+        <div style="margin-top: 1rem; font-size: 0.9rem; color: #355a5f;">Admin can clear players for Round ${state.roundNumber + 1}</div>
       </div>
     `;
     return;
@@ -1251,12 +393,12 @@ function renderHint() {
   }
 
   if (state.isRoundActive) {
-    const tripsLeft = Math.max(0, state.maxTripsPerPlayer - me.tripCount);
+    const tripsLeft = Math.max(0, state.maxTripsPerPlayer - me.trips.length);
     ui.mapHint.textContent = `Round live: click once for start, once for end to add your trip. ${tripsLeft} trips left.`;
     return;
   }
 
-  if (!isAdminUser()) {
+  if (!me.isAdmin) {
     if (state.roundResult) {
       ui.mapHint.textContent = `Round ${state.roundNumber} ended. Waiting for the admin to reset Round ${state.roundNumber + 1}.`;
       return;
@@ -1267,7 +409,7 @@ function renderHint() {
   }
 
   if (state.roundResult) {
-    ui.mapHint.textContent = `Round ${state.roundNumber} ended. Start Timer or Clear Players will reset the game for Round ${state.roundNumber + 1}.`;
+    ui.mapHint.textContent = `Round ${state.roundNumber} ended. Use Clear Players to start Round ${state.roundNumber + 1}.`;
     return;
   }
 
@@ -1294,11 +436,7 @@ function clearPendingStart() {
 }
 
 function getMe() {
-  return state.participants.find((participant) => participant.id === state.authUid) || null;
-}
-
-function isAdminUser() {
-  return Boolean(state.authUid) && state.authUid === state.adminUid;
+  return state.participants.find((participant) => participant.socketId === state.meSocketId);
 }
 
 function renderTimer() {
@@ -1308,66 +446,12 @@ function renderTimer() {
   }
 
   const remainingMs = Math.max(0, state.roundEndsAtMs - Date.now());
-  const remainingSeconds = Math.ceil(remainingMs / 1000);
-  const minutes = Math.floor(remainingSeconds / 60)
+  const remainingSec = Math.ceil(remainingMs / 1000);
+  const mins = Math.floor(remainingSec / 60)
     .toString()
     .padStart(2, "0");
-  const seconds = (remainingSeconds % 60).toString().padStart(2, "0");
-  ui.timerDisplay.textContent = `${minutes}:${seconds}`;
-}
-
-function buildTripSummary(trips) {
-  return {
-    tripCount: trips.length,
-    totalDistanceKm: trips.reduce((sum, trip) => sum + trip.distanceKm, 0),
-    longestTripDistanceKm: trips.reduce((maxDistance, trip) => Math.max(maxDistance, trip.distanceKm), 0),
-  };
-}
-
-function calculateRoundResult(participants) {
-  if (participants.length === 0) {
-    return null;
-  }
-
-  const highestCount = Math.max(...participants.map((participant) => participant.tripCount));
-  const mostTripPlayers = highestCount === 0
-    ? []
-    : participants.filter((participant) => participant.tripCount === highestCount).map((participant) => participant.name);
-
-  const longestTripParticipant = participants.reduce(
-    (winner, participant) => (participant.longestTripDistanceKm > winner.longestTripDistanceKm ? participant : winner),
-    { name: "No trips", longestTripDistanceKm: 0 },
-  );
-
-  return {
-    mostTripPlayers,
-    highestCount,
-    longestTripName: longestTripParticipant.name,
-    longestTripDistanceKm: longestTripParticipant.longestTripDistanceKm,
-  };
-}
-
-function pickColor(seed) {
-  let hash = 0;
-  for (let index = 0; index < seed.length; index += 1) {
-    hash = (hash * 31 + seed.charCodeAt(index)) >>> 0;
-  }
-  return colors[hash % colors.length];
-}
-
-function haversineKm(lat1, lon1, lat2, lon2) {
-  const earthRadiusKm = 6371;
-  const dLat = toRad(lat2 - lat1);
-  const dLon = toRad(lon2 - lon1);
-  const a =
-    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) * Math.sin(dLon / 2);
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-  return earthRadiusKm * c;
-}
-
-function toRad(degrees) {
-  return (degrees * Math.PI) / 180;
+  const secs = (remainingSec % 60).toString().padStart(2, "0");
+  ui.timerDisplay.textContent = `${mins}:${secs}`;
 }
 
 function escapeHtml(value) {
@@ -1377,35 +461,6 @@ function escapeHtml(value) {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#039;");
-}
-
-function isFirebaseConfigReady() {
-  return Boolean(
-    FIREBASE_CONFIG
-      && FIREBASE_CONFIG.apiKey
-      && !FIREBASE_CONFIG.apiKey.startsWith("YOUR_")
-      && FIREBASE_CONFIG.projectId
-      && !FIREBASE_CONFIG.projectId.startsWith("YOUR_"),
-  );
-}
-
-function canUseLocalDemoMode() {
-  return window.location.protocol === "file:"
-    || window.location.hostname === "localhost"
-    || window.location.hostname === "127.0.0.1";
-}
-
-function renderSetupError(message) {
-  ui.joinBtn.disabled = true;
-  ui.startTimerBtn.disabled = true;
-  ui.clearStartBtn.hidden = true;
-  ui.deleteLastTripBtn.hidden = true;
-  ui.clearResultsBtn.hidden = true;
-  ui.adminStatusBadge.textContent = "Setup Required";
-  ui.adminStatusBadge.classList.remove("is-admin");
-  ui.mapHint.textContent = message;
-  ui.results.classList.remove("empty");
-  ui.results.innerHTML = `<div>${escapeHtml(message)}</div>`;
 }
 
 renderAll();
