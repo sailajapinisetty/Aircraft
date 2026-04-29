@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>World Trip Sprint</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=DM+Serif+Display:ital@0;1&family=Space+Grotesk:wght@400;500;700&display=swap"
+      rel="stylesheet"
+    />
+    <link
+      rel="stylesheet"
+      href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+      crossorigin=""
+    />
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <div class="bg-orb bg-orb-1" aria-hidden="true"></div>
+    <div class="bg-orb bg-orb-2" aria-hidden="true"></div>
+
+    <main class="app-shell">
+      <header class="topbar">
+        <div>
+          <h1>World Trip Sprint</h1>
+          <p>Anyone opening this URL can join with a name + pin and play live.</p>
+        </div>
+        <div class="timer-wrap">
+          <div id="adminStatusBadge" class="admin-status-badge">Waiting for admin</div>
+          <div class="timer" id="timerDisplay">01:00</div>
+          <button id="startTimerBtn" class="btn btn-primary">Start Timer</button>
+        </div>
+      </header>
+
+      <section class="content-grid">
+        <div class="map-panel">
+          <div class="map-toolbar">
+            <button id="joinBtn" class="btn btn-accent">Join</button>
+            <span class="players-label">Players</span>
+            <div id="activeParticipantChips" class="participant-chips" aria-live="polite">
+              <span class="empty-chip">No participants yet</span>
+            </div>
+            <button id="clearStartBtn" class="btn btn-ghost" title="Clear start point (or press Escape)" hidden>Clear Start</button>
+            <button id="deleteLastTripBtn" class="btn btn-ghost" title="Delete last trip (or press Backspace)" hidden>Delete Last Trip</button>
+            <span class="hint" id="mapHint">Start the timer to begin placing trips.</span>
+          </div>
+          <div id="map" aria-label="World map"></div>
+        </div>
+
+        <aside class="sidebar">
+          <section class="panel">
+            <h2>Participants</h2>
+            <ul id="participantList" class="participant-list">
+              <li class="empty">No one joined yet.</li>
+            </ul>
+          </section>
+
+          <section class="panel">
+            <div style="display: flex; align-items: center; justify-content: space-between; gap: 0.5rem;">
+              <h2 style="margin: 0;">Round Result</h2>
+              <button id="clearResultsBtn" class="btn btn-ghost" style="font-size: 0.85rem; padding: 0.4rem 0.7rem;" title="Admin only: Clear all players and restart" hidden>👑 Clear Players</button>
+            </div>
+            <div id="results" class="results empty">Results appear when timer reaches 00:00.</div>
+          </section>
+
+          <section class="panel instructions">
+            <h2>How to Play</h2>
+            <ol>
+              <li>Each person opens this same URL and clicks Join.</li>
+              <li>Pick your name and pin object.</li>
+              <li>Any player can press Start Timer.</li>
+              <li>Click map once for start and again for end.</li>
+            </ol>
+          </section>
+        </aside>
+      </section>
+    </main>
+
+    <div id="joinModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="joinTitle">
+      <div class="modal-card">
+        <h2 id="joinTitle">Join This Round</h2>
+        <form id="joinForm">
+          <label for="participantName">Name</label>
+          <input id="participantName" name="participantName" maxlength="24" required />
+
+          <label for="participantObject">Object Marker</label>
+          <select id="participantObject" name="participantObject" required>
+            <option value="pin">Pin</option>
+            <option value="diamond">Diamond</option>
+            <option value="circle">Circle</option>
+            <option value="flag">Flag</option>
+          </select>
+
+          <div class="modal-actions">
+            <button type="button" id="cancelJoinBtn" class="btn btn-ghost">Cancel</button>
+            <button type="submit" class="btn btn-primary">Join</button>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <script
+      src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+      integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+      crossorigin=""
+    ></script>
+    <script src="/socket.io/socket.io.js"></script>
+    <script src="app.js"></script>
+  </body>
+</html>
